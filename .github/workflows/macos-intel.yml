@@ -1,0 +1,208 @@
+# Builds rox for Intel Macs (x86_64) running macOS 13 or newer.
+#
+# This is an unofficial community build. It does not change any rox source code:
+# it compiles the same code the official Apple Silicon release uses, on GitHub's
+# last Intel Mac runner, and packages it with an alternative icon.
+#
+# How to use: GitHub repo -> Actions tab -> "Build rox for Intel Mac" ->
+# "Run workflow". When it finishes (roughly 30-60 minutes) the DMG and ZIP
+# appear on the repo's Releases page.
+#
+# Two things live outside the rox source so that "Sync fork" never conflicts:
+#   .github/workflows/macos-intel.yml   (this file)
+#   rox-intel.icns                      (the app icon, in the repo root)
+
+name: Build rox for Intel Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag of rox to build. Leave empty to build this repo's main branch."
+        required: false
+        default: ""
+      stock_renderer:
+        description: "Use Apple's stock Metal renderer (recommended for Intel Macs; turns off rox's custom shader panels). Untick to build with the blade renderer instead."
+        type: boolean
+        required: false
+        default: true
+
+# Needed to publish the finished app on the Releases page.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # GitHub's last native Intel Mac runner (Intel Macs are retired on Actions in fall 2027).
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+    env:
+      # The runner is macOS 15. Without this, C/C++ parts (libprojectM) could be
+      # tagged as needing macOS 15, and macOS 13 would refuse to open the app.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      # Newer CMake versions reject the older CMake files some vendored C++ code ships.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Show the build machine
+        run: |
+          uname -m
+          sw_vers
+          xcodebuild -version
+          df -h /
+
+      # The runner has ~14 GB of disk and a release build of rox is large. Drop
+      # tools this build never touches so the packaging step doesn't run out of space.
+      - name: Free up disk space
+        run: |
+          rm -rf "$HOME/Library/Android" || true
+          xcrun simctl delete all 2>/dev/null || true
+          df -h /
+
+      # gpui compiles Metal shaders with `xcrun metal`. Xcode 16 (the default on
+      # this runner) already includes it; Xcode 26 ships it as a separate download.
+      - name: Ensure Metal toolchain
+        run: |
+          if ! xcrun -f metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      # cmake builds libprojectM (the Milkdrop visualizer) from source.
+      - name: Ensure cmake
+        run: command -v cmake >/dev/null || brew install cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Confirm this is an Intel (x86_64) build
+        run: |
+          rustc -vV
+          rustc -vV | grep -q 'host: x86_64-apple-darwin' \
+            || { echo "::error::Expected an x86_64 Mac runner"; exit 1; }
+
+      # ON by default. rox renders through "blade" on Metal so that its shader
+      # features work, but blade is less proven on older Intel GPUs. This drops
+      # back to gpui's stock Metal renderer: the app still runs, but the custom
+      # shader panels stop working (the rox authors document this trade-off).
+      - name: Use stock Metal renderer (default)
+        if: inputs.stock_renderer
+        run: |
+          perl -ni -e 'print unless /features = \["macos-blade"\]/' crates/rox/Cargo.toml
+          if grep -q 'macos-blade' crates/rox/Cargo.toml; then
+            echo "::error::Could not remove the macos-blade feature line"; exit 1
+          fi
+          echo "Building with the stock Metal renderer."
+
+      # vendor/ is not in git; Cargo can't even resolve dependencies without it.
+      - name: Vendor patched crates and libprojectM
+        run: |
+          scripts/vendor-gpui.sh
+          scripts/vendor-projectm.sh
+
+      - name: Build
+        run: cargo build --release --package rox --package rox-mcp
+
+      # Fail early, with a clear message, if the result wouldn't run on macOS 13.
+      - name: Verify architecture and minimum macOS version
+        run: |
+          for bin in target/release/rox target/release/rox-mcp; do
+            echo "== $bin"
+            lipo -info "$bin"
+            lipo -archs "$bin" | grep -qx 'x86_64' \
+              || { echo "::error::$bin is not a plain x86_64 binary"; exit 1; }
+            otool -l "$bin" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' || true
+            minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+            if [ -n "$minos" ]; then
+              major=${minos%%.*}
+              if [ "$major" -gt 13 ]; then
+                echo "::error::$bin requires macOS $minos, newer than 13"; exit 1
+              fi
+            fi
+          done
+          echo "Frameworks rox links against:"
+          otool -L target/release/rox
+
+      - name: Package app, ZIP and DMG
+        id: package
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          NAME="rox-v$VERSION-macos-x86_64"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+          mkdir -p rox.app/Contents/MacOS rox.app/Contents/Resources
+          cp target/release/rox rox.app/Contents/MacOS/
+          cp target/release/rox-mcp rox.app/Contents/MacOS/
+          # The alternative icon lives in the repo root, outside rox's own files.
+          cp rox-intel.icns rox.app/Contents/Resources/rox.icns
+          sed "s/__VERSION__/$VERSION/" crates/rox/assets/app/Info.plist \
+            > rox.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 13.0" \
+            rox.app/Contents/Info.plist
+
+          # Free the build tree before the DMG step (it needs disk space).
+          rm -rf target
+          df -h /
+
+          # No Apple developer certificate here, so the app is signed "ad-hoc".
+          # That is enough to run; the release notes explain the first-launch prompt.
+          codesign --force --deep -s - rox.app
+          codesign --verify --verbose=2 rox.app
+
+          # The ZIP is the simple, always-works download.
+          ditto -c -k --sequesterRsrc --keepParent rox.app "$NAME.zip"
+          ls -lh "$NAME.zip"
+
+      # Best effort: a styled drag-to-install DMG. If Finder styling hiccups on the
+      # runner, the ZIP above is still published.
+      - name: Make DMG
+        continue-on-error: true
+        run: scripts/make-dmg.sh rox.app "${{ steps.package.outputs.name }}.dmg"
+
+      - name: Checksums
+        run: |
+          shasum -a 256 rox-v*.zip > SHA256SUMS.txt
+          if ls rox-v*.dmg >/dev/null 2>&1; then shasum -a 256 rox-v*.dmg >> SHA256SUMS.txt; fi
+          cat SHA256SUMS.txt
+
+      - name: Keep a copy as a workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            rox-v*.zip
+            rox-v*.dmg
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish on the Releases page
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+          RENDERER: ${{ inputs.stock_renderer && 'stock Metal renderer' || 'blade on Metal' }}
+        run: |
+          TAG="intel-v$VERSION-run$GITHUB_RUN_NUMBER"
+          cat > notes.md <<EOF
+          Unofficial **Intel (x86_64) build of rox $VERSION** for macOS 13 and newer.
+          Built from the unmodified rox source with GitHub Actions. Renderer: $RENDERER.
+
+          **Install**
+          1. Open the DMG (or unzip the ZIP) and drag \`rox\` into Applications.
+          2. This build is not notarized by Apple, so macOS blocks the first launch.
+             Either right-click the app, choose **Open**, then **Open** again, or run this once in Terminal:
+
+             \`xattr -dr com.apple.quarantine /Applications/rox.app\`
+
+          The in-app updater only announces new versions here; it will not install them. To update, run this workflow again.
+          EOF
+
+          files=(rox-v*.zip SHA256SUMS.txt)
+          ls rox-v*.dmg >/dev/null 2>&1 && files+=(rox-v*.dmg)
+          gh release create "$TAG" "${files[@]}" \
+            --target "$(git rev-parse HEAD)" \
+            --title "rox $VERSION for Intel Mac (run $GITHUB_RUN_NUMBER)" \
+            --notes-file notes.md
